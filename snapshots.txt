@@ -1,0 +1,7 @@
+Process Manager Snapshot Log
+============================
+Initial Process Table
+PID		PPID		STATE		EXIT_STATUS
+----------------------------------------------
+1		0		RUNNING		-
+
