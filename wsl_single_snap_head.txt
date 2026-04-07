@@ -1,0 +1,10 @@
+Initial Process Table
+PID		PPID		STATE		EXIT_STATUS
+----------------------------------------------
+1		0		RUNNING		-
+
+Thread 0 calls pm_ps
+PID		PPID		STATE		EXIT_STATUS
+----------------------------------------------
+1		0		RUNNING		-
+2		1		RUNNING		-

@@ -1,0 +1,36 @@
+========================================
+  Multithreaded Process Manager
+========================================
+
+[PM] Process table initialized. Init process (PID 1) created.
+[MAIN] Creating monitor thread...
+[MAIN] Creating 1 worker threads...
+[MONITOR] Monitor thread started
+[MAIN] Waiting for worker threads to complete...
+[WORKER 0] Starting with file: ultra_simple.txt
+[MONITOR] Initial snapshot written
+[WORKER 0] Executing: fork 1
+[PM] Process forked: PID 2 (parent: 1)
+[WORKER 0] Fork successful: new PID 2
+[WORKER 0] Executing: ps
+[WORKER 0] Printing process table:
+PID		PPID		STATE		EXIT_STATUS
+----------------------------------------------
+1		0		RUNNING		-
+2		1		RUNNING		-
+[WORKER 0] Finished reading commands
+[MONITOR] Snapshot written after operation
+[MAIN] All worker threads completed
+[MAIN] Stopping monitor thread...
+[MONITOR] Monitor thread stopping
+
+[MAIN] Final Process Table:
+PID		PPID		STATE		EXIT_STATUS
+----------------------------------------------
+1		0		RUNNING		-
+2		1		RUNNING		-
+[PM] Process manager shut down.
+
+========================================
+  Process Manager Shut Down
+========================================

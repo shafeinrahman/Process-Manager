@@ -1,0 +1,29 @@
+# Example command file 2 - More complex scenarios
+# This file runs concurrently with commands1.txt and demonstrates
+# nested process creation from different parents
+
+# Fork a child from init
+fork 1
+sleep 200
+
+# Create children from the newly forked process (PID 2)
+fork 2
+sleep 100
+
+fork 2
+sleep 100
+
+# Print table from worker 2's perspective
+ps
+
+# Exit child processes
+exit 5 5
+sleep 100
+
+# Kill another process
+kill 6
+
+sleep 200
+
+# Final print
+ps
