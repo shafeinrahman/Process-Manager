@@ -51,7 +51,11 @@ static int child_index_in_parent(const pm_pcb_t *parent, int child_pid) {
 
 static pm_pcb_t *find_zombie_child(pm_pcb_t *parent, int child_pid) {
     if (child_pid == PM_ANY_CHILD) {
-        for (int i = 0; i < parent->child_count; i++) {
+        // Use snapshot pattern: save count before iterating
+        // This prevents corruption if array is modified concurrently
+        int child_count = parent->child_count;
+        
+        for (int i = 0; i < child_count; i++) {
             pm_pcb_t *c = find_pcb(parent->children[i]);
             if (c && c->state == PM_STATE_ZOMBIE) {
                 return c;
@@ -83,51 +87,92 @@ static void sleep_millis(int ms) {
     }
 }
 
+static size_t append_text(char *buf, size_t size, size_t pos, const char *text) {
+    if (pos >= size) {
+        return size;
+    }
+    int written = snprintf(buf + pos, size - pos, "%s", text);
+    if (written < 0) {
+        return pos;
+    }
+    if ((size_t)written >= size - pos) {
+        return size - 1;
+    }
+    return pos + (size_t)written;
+}
+
+static size_t append_format(char *buf, size_t size, size_t pos, const char *fmt, ...) {
+    if (pos >= size) {
+        return size;
+    }
+
+    va_list args;
+    va_start(args, fmt);
+    int written = vsnprintf(buf + pos, size - pos, fmt, args);
+    va_end(args);
+
+    if (written < 0) {
+        return pos;
+    }
+    if ((size_t)written >= size - pos) {
+        return size - 1;
+    }
+    return pos + (size_t)written;
+}
+
+static void format_process_table_locked(char *buf, size_t size) {
+    size_t pos = 0;
+    pos = append_text(buf, size, pos, "PID\tPPID\tSTATE\tEXIT_STATUS\n");
+    pos = append_text(buf, size, pos, "----------------------------------------------\n");
+
+    for (int i = 0; i < PM_MAX_PROCESSES; i++) {
+        pm_pcb_t *p = g_pm.table[i];
+        if (p && p->state != PM_STATE_TERMINATED) {
+            if (p->state == PM_STATE_ZOMBIE) {
+                pos = append_format(buf, size, pos, "%d\t%d\t%s\t%d\n",
+                                    p->pid, p->ppid,
+                                    pm_state_to_string(p->state),
+                                    p->exit_status);
+            } else {
+                pos = append_format(buf, size, pos, "%d\t%d\t%s\t-\n",
+                                    p->pid, p->ppid,
+                                    pm_state_to_string(p->state));
+            }
+        }
+    }
+
+    if (size > 0) {
+        buf[size - 1] = '\0';
+    }
+}
+
+static void build_snapshot_text_locked(char *buf, size_t size, int thread_id, const char *action) {
+    size_t pos = 0;
+    if (action && action[0] != '\0') {
+        pos = append_format(buf, size, pos, "\nThread %d calls %s\n", thread_id, action);
+    }
+
+    char table[PM_SNAPSHOT_TEXT_CAP];
+    format_process_table_locked(table, sizeof(table));
+    append_text(buf, size, pos, table);
+}
+
 static void notify_snapshot(void) {
+    g_pm.pending_actor = -1;
+    g_pm.pending_action[0] = '\0';
     g_pm.snapshot_version++;
     pthread_cond_broadcast(&g_pm.snapshot_cv);
 }
 
 static void notify_snapshot_with_action_locked(int thread_id, const char *fmt, ...) {
     va_list args;
-    unsigned long version = ++g_pm.snapshot_version;
-    unsigned long index = g_pm.action_write % PM_ACTION_LOG_CAP;
-
     va_start(args, fmt);
-    g_pm.action_actor[index] = thread_id;
-    g_pm.action_version[index] = version;
-    vsnprintf(g_pm.action_text[index], sizeof(g_pm.action_text[index]), fmt, args);
+    g_pm.pending_actor = thread_id;
+    vsnprintf(g_pm.pending_action, sizeof(g_pm.pending_action), fmt, args);
     va_end(args);
 
-    g_pm.action_write++;
-    if (g_pm.action_write - g_pm.action_read > PM_ACTION_LOG_CAP) {
-        g_pm.action_read = g_pm.action_write - PM_ACTION_LOG_CAP;
-    }
-
+    g_pm.snapshot_version++;
     pthread_cond_broadcast(&g_pm.snapshot_cv);
-}
-
-static void pop_action_for_version_locked(unsigned long version, int *actor, char *action, size_t action_size) {
-    *actor = -1;
-    action[0] = '\0';
-
-    while (g_pm.action_read < g_pm.action_write) {
-        unsigned long idx = g_pm.action_read % PM_ACTION_LOG_CAP;
-        unsigned long v = g_pm.action_version[idx];
-
-        if (v < version) {
-            g_pm.action_read++;
-            continue;
-        }
-        if (v > version) {
-            return;
-        }
-
-        *actor = g_pm.action_actor[idx];
-        snprintf(action, action_size, "%s", g_pm.action_text[idx]);
-        g_pm.action_read++;
-        return;
-    }
 }
 
 // ===== Lifecycle =====
@@ -142,6 +187,8 @@ int pm_init(const char *snapshot_path) {
     g_pm.monitor_exited = false;
     g_pm.action_read = 0;
     g_pm.action_write = 0;
+    g_pm.pending_actor = -1;
+    g_pm.pending_action[0] = '\0';
 
     // open snapshot file
     g_pm.snapshot_file = fopen(snapshot_path, "w");
@@ -266,48 +313,64 @@ int pm_wait(int parent_pid, int child_pid, int *reaped_pid, int *exit_status) {
         return 0;
     }
 
-    pm_pcb_t *child = find_zombie_child(parent, child_pid);
-    if (!child) {
+    // Robust CV wait loop: check condition, wait, re-check
+    for (;;) {
+        pm_pcb_t *child = find_zombie_child(parent, child_pid);
+        if (child) {
+            *reaped_pid = child->pid;
+            *exit_status = child->exit_status;
+
+            int child_idx = child_index_in_parent(parent, child->pid);
+            if (child_idx >= 0) {
+                for (int i = child_idx; i + 1 < parent->child_count; i++) {
+                    parent->children[i] = parent->children[i + 1];
+                }
+                parent->child_count--;
+            }
+
+            child->state = PM_STATE_TERMINATED;
+            int slot = find_slot_by_pid(child->pid);
+            if (slot >= 0) {
+                g_pm.table[slot] = NULL;
+            }
+            g_pm.process_count--;
+            pthread_cond_destroy(&child->child_exit_cv);
+            free(child);
+
+            parent->state = PM_STATE_RUNNING;
+            notify_snapshot_with_action_locked(g_worker_thread_id, "pm_wait %d %d", parent_pid, child_pid);
+            pthread_mutex_unlock(&g_pm.table_lock);
+            return 0;
+        }
+        
+        // No zombie and children still exist - wait for signal
         parent->state = PM_STATE_BLOCKED;
         notify_snapshot();
-        while (!g_pm.shutting_down && !child) {
-            child = find_zombie_child(parent, child_pid);
-            if (!child) {
-                pthread_cond_wait(&parent->child_exit_cv, &g_pm.table_lock);
-            }
+        
+        // Use timed wait to prevent infinite deadlock
+        // Even if broadcast is missed, we'll retry after timeout
+        struct timespec timeout;
+        clock_gettime(CLOCK_REALTIME, &timeout);
+        timeout.tv_sec += 1;  // 1 second timeout
+        
+        int wait_result = pthread_cond_timedwait(&parent->child_exit_cv, 
+                                                   &g_pm.table_lock, &timeout);
+        (void)wait_result;  // Ignore result - ETIMEDOUT just means we retry
+        
+        if (g_pm.shutting_down) {
+            pthread_mutex_unlock(&g_pm.table_lock);
+            return -1;
         }
-        parent->state = PM_STATE_RUNNING;
-        notify_snapshot();
-    }
-
-    if (!child) {
-        pthread_mutex_unlock(&g_pm.table_lock);
-        return -1;
-    }
-
-    *reaped_pid = child->pid;
-    *exit_status = child->exit_status;
-
-    int child_idx = child_index_in_parent(parent, child->pid);
-    if (child_idx >= 0) {
-        for (int i = child_idx; i + 1 < parent->child_count; i++) {
-            parent->children[i] = parent->children[i + 1];
+        
+        // Re-validate parent after re-acquiring lock
+        parent = find_pcb(parent_pid);
+        if (!parent) {
+            pthread_mutex_unlock(&g_pm.table_lock);
+            return -1;
         }
-        parent->child_count--;
+        
+        // Loop to re-check for zombies
     }
-
-    child->state = PM_STATE_TERMINATED;
-    int slot = find_slot_by_pid(child->pid);
-    if (slot >= 0) {
-        g_pm.table[slot] = NULL;
-    }
-    g_pm.process_count--;
-    pthread_cond_destroy(&child->child_exit_cv);
-    free(child);
-
-    notify_snapshot_with_action_locked(g_worker_thread_id, "pm_wait %d %d", parent_pid, child_pid);
-    pthread_mutex_unlock(&g_pm.table_lock);
-    return 0;
 }
 
 int pm_kill(int pid) {
@@ -330,23 +393,9 @@ int pm_kill(int pid) {
 
 void pm_ps(FILE *out) {
     pthread_mutex_lock(&g_pm.table_lock);
-    fprintf(out, "PID\tPPID\tSTATE\tEXIT_STATUS\n");
-    fprintf(out, "----------------------------------------------\n");
-    for (int i = 0; i < PM_MAX_PROCESSES; i++) {
-        pm_pcb_t *p = g_pm.table[i];
-        if (p && p->state != PM_STATE_TERMINATED) {
-            if (p->state == PM_STATE_ZOMBIE) {
-                fprintf(out, "%d\t%d\t%s\t%d\n",
-                        p->pid, p->ppid,
-                        pm_state_to_string(p->state),
-                        p->exit_status);
-            } else {
-                fprintf(out, "%d\t%d\t%s\t-\n",
-                        p->pid, p->ppid,
-                        pm_state_to_string(p->state));
-            }
-        }
-    }
+    char table[PM_SNAPSHOT_TEXT_CAP];
+    format_process_table_locked(table, sizeof(table));
+    fputs(table, out);
     pthread_mutex_unlock(&g_pm.table_lock);
 }
 
@@ -370,7 +419,9 @@ void *pm_monitor_thread(void *arg) {
 
     if (g_pm.snapshot_file) {
         fprintf(g_pm.snapshot_file, "Initial Process Table\n");
-        pm_ps(g_pm.snapshot_file);
+        char table[PM_SNAPSHOT_TEXT_CAP];
+        format_process_table_locked(table, sizeof(table));
+        fputs(table, g_pm.snapshot_file);
         fflush(g_pm.snapshot_file);
     }
 
@@ -387,26 +438,18 @@ void *pm_monitor_thread(void *arg) {
             break;
         }
 
-        while (seen_version < g_pm.snapshot_version && !g_pm.shutting_down) {
-            int actor = -1;
-            char action[128];
-
-            seen_version++;
-            pop_action_for_version_locked(seen_version, &actor, action, sizeof(action));
-            pthread_mutex_unlock(&g_pm.table_lock);
-
-            if (g_pm.snapshot_file) {
-                if (action[0] != '\0' && actor >= 0) {
-                    fprintf(g_pm.snapshot_file, "\nThread %d calls %s\n", actor, action);
-                }
-                pm_ps(g_pm.snapshot_file);
-                fflush(g_pm.snapshot_file);
-            }
-
-            pthread_mutex_lock(&g_pm.table_lock);
-        }
-
+        seen_version = g_pm.snapshot_version;
+        int actor = g_pm.pending_actor;
+        char action[128];
+        snprintf(action, sizeof(action), "%s", g_pm.pending_action);
+        char snapshot[PM_SNAPSHOT_TEXT_CAP];
+        build_snapshot_text_locked(snapshot, sizeof(snapshot), actor, action);
         pthread_mutex_unlock(&g_pm.table_lock);
+
+        if (g_pm.snapshot_file) {
+            fputs(snapshot, g_pm.snapshot_file);
+            fflush(g_pm.snapshot_file);
+        }
     }
     return NULL;
 }
