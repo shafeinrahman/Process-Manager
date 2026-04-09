@@ -9,6 +9,7 @@
 #define PM_INIT_PID 1
 #define PM_INIT_PPID 0
 #define PM_ANY_CHILD (-1)
+#define PM_ACTION_LOG_CAP 256
 
 /* Process lifecycle states for the simulator. */
 typedef enum {
@@ -43,6 +44,14 @@ typedef struct pm_manager {
     pthread_cond_t snapshot_cv;
     unsigned long snapshot_version;
     bool shutting_down;
+    bool monitor_started;
+    bool monitor_exited;
+
+    int action_actor[PM_ACTION_LOG_CAP];
+    char action_text[PM_ACTION_LOG_CAP][128];
+    unsigned long action_version[PM_ACTION_LOG_CAP];
+    unsigned long action_read;
+    unsigned long action_write;
 
     FILE *snapshot_file;
 } pm_manager_t;
