@@ -1,4 +1,5 @@
 /* ======process_manager.h Begins==== */
+#define _POSIX_C_SOURCE 199309L
 #ifndef PROCESS_MANAGER_H
 #define PROCESS_MANAGER_H
 
@@ -82,7 +83,6 @@ const char *pm_state_to_string(pm_state_t state); //state to string for printing
 /* ======process_manager.h Ends==== */
 
 /* ======pm.c Begins==== */
-#include "process_manager.h"
 #include <stdarg.h>
 #include <time.h>
 #include <stdlib.h>
@@ -630,8 +630,6 @@ const char *pm_state_to_string(pm_state_t state) {
 /* ======pm.c Ends==== */
 
 /* ======main.c Begins==== */
-#include "process_manager.h"
-
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
