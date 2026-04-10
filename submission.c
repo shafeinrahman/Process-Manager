@@ -253,11 +253,18 @@ static void notify_snapshot(void) {
 }
 
 static void notify_snapshot_with_action_locked(int thread_id, const char *fmt, ...) {
+    // Queue the action in the circular buffer
+    int write_pos = g_pm.action_write % PM_ACTION_LOG_CAP;
+    
+    g_pm.action_actor[write_pos] = thread_id;
+    
     va_list args;
     va_start(args, fmt);
-    g_pm.pending_actor = thread_id;
-    vsnprintf(g_pm.pending_action, sizeof(g_pm.pending_action), fmt, args);
+    vsnprintf(g_pm.action_text[write_pos], sizeof(g_pm.action_text[write_pos]), fmt, args);
     va_end(args);
+    
+    g_pm.action_version[write_pos] = g_pm.snapshot_version;
+    g_pm.action_write++;
 
     g_pm.snapshot_version++;
     pthread_cond_broadcast(&g_pm.snapshot_cv);
@@ -428,12 +435,8 @@ int pm_wait(int parent_pid, int child_pid, int *reaped_pid, int *exit_status) {
             pthread_cond_destroy(&child->child_exit_cv);
             free(child);
 
-            // Restore parent to RUNNING state if it was blocked
-            if (parent->state == PM_STATE_BLOCKED) {
-                parent->state = PM_STATE_RUNNING;
-                notify_snapshot();
-            }
-
+            // Restore parent to RUNNING state
+            parent->state = PM_STATE_RUNNING;
             notify_snapshot_with_action_locked(g_worker_thread_id, "pm_wait %d %d", parent_pid, child_pid);
             pthread_mutex_unlock(&g_pm.table_lock);
             return 0;
@@ -441,7 +444,6 @@ int pm_wait(int parent_pid, int child_pid, int *reaped_pid, int *exit_status) {
         
         // No zombie and children still exist - wait for signal
         parent->state = PM_STATE_BLOCKED;
-        notify_snapshot();
         
         // Use timed wait to prevent infinite deadlock
         // Even if broadcast is missed, we'll retry after timeout
@@ -455,7 +457,6 @@ int pm_wait(int parent_pid, int child_pid, int *reaped_pid, int *exit_status) {
         
         if (g_pm.shutting_down) {
             parent->state = PM_STATE_RUNNING;
-            notify_snapshot();
             pthread_mutex_unlock(&g_pm.table_lock);
             return -1;
         }
@@ -552,17 +553,26 @@ void *pm_monitor_thread(void *arg) {
         }
 
         seen_version = g_pm.snapshot_version;
-        int actor = g_pm.pending_actor;
-        char action[128];
-        snprintf(action, sizeof(action), "%s", g_pm.pending_action);
-        char snapshot[PM_SNAPSHOT_TEXT_CAP];
-        build_snapshot_text_locked(snapshot, sizeof(snapshot), actor, action);
-        pthread_mutex_unlock(&g_pm.table_lock);
-
-        if (g_pm.snapshot_file) {
-            fputs(snapshot, g_pm.snapshot_file);
-            fflush(g_pm.snapshot_file);
+        
+        // Process all queued actions
+        while (g_pm.action_read < g_pm.action_write) {
+            int read_pos = g_pm.action_read % PM_ACTION_LOG_CAP;
+            int actor = g_pm.action_actor[read_pos];
+            char action[128];
+            snprintf(action, sizeof(action), "%s", g_pm.action_text[read_pos]);
+            
+            char snapshot[PM_SNAPSHOT_TEXT_CAP];
+            build_snapshot_text_locked(snapshot, sizeof(snapshot), actor, action);
+            
+            if (g_pm.snapshot_file) {
+                fputs(snapshot, g_pm.snapshot_file);
+                fflush(g_pm.snapshot_file);
+            }
+            
+            g_pm.action_read++;
         }
+        
+        pthread_mutex_unlock(&g_pm.table_lock);
     }
     return NULL;
 }
