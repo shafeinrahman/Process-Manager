@@ -1,3 +1,0 @@
-# Ultra simple test - just fork and ps
-fork 1
-ps

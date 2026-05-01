@@ -1,8 +1,0 @@
-========================================
-  Multithreaded Process Manager
-========================================
-
-[PM] Process table initialized. Init process (PID 1) created.
-[MAIN] Creating monitor thread...
-[MAIN] Creating 1 worker threads...
-[MONITOR] Monitor thread started
